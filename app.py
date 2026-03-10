@@ -1,10 +1,13 @@
 import streamlit as st
-import chromadb
-import json
+import faiss
+import pickle
+import numpy as np
 import os
 from dotenv import load_dotenv
 import google.generativeai as genai
-import pandas as pd
+
+# NEW IMPORT: Bring in Sentence Transformers for the 384-dimension embeddings
+from sentence_transformers import SentenceTransformer
 
 # --- 1. SETUP & CONFIG ---
 load_dotenv()
@@ -17,131 +20,144 @@ if not GEMINI_API_KEY:
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-3.1-pro') 
 
-# Initialize ChromaDB (In-memory)
-chroma_client = chromadb.Client()
-collection = chroma_client.get_or_create_collection(name="employee_skills")
+# Initialize the local embedding model (This perfectly matches your .faiss file!)
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
-# --- 2. LOAD YOUR SPECIFIC DATABASE ---
-@st.cache_data
-def load_database():
+embedding_model = load_embedding_model()
+
+# ... (Keep your load_faiss_db function the same) ...
+
+def get_query_embedding(text):
+    """
+    Converts the user's query into a 384-dimension math vector 
+    using the exact same model that built the FAISS index.
+    """
     try:
-        # Loading your specific dataset
-        df = pd.read_csv('dataset/cleaned_employee_llm_data.csv')
+        # Encode the text locally using Sentence Transformers
+        embedding = embedding_model.encode(text)
         
-        # ⚠️ Hackathon Tip: Loading 10,000 rows into a vector DB takes time. 
-        # For a fast demo, we limit to 500. Change this number if you want more!
-        df_demo = df.head(10000) 
-        
-        db_list = []
-        for index, row in df_demo.iterrows():
-            emp_id = str(row['id'])
-            profile_text = str(row['text_for_llm'])
-            
-            # Since the data is condensed, we map what we can and synthesize the rest
-            db_list.append({
-                "id": emp_id,
-                "name": f"Employee {emp_id}",
-                "contact": f"emp_{emp_id}@synthetic-company.com",
-                "profile": profile_text
-            })
-        return db_list
-        
-    except FileNotFoundError:
-        st.error("Could not find dataset/cleaned_employee_llm_data.csv. Please ensure the folder and file exist.")
-        st.stop()
+        # FAISS strictly requires numpy arrays of type float32, shaped as (1, dimension)
+        return np.array([embedding], dtype=np.float32)
     except Exception as e:
-        st.error(f"Error reading database: {e}")
+        st.error(f"Embedding failed: {e}")
         st.stop()
 
-db = load_database()
+# --- 2. LOAD FAISS DATABASE & METADATA ---
+@st.cache_resource
+def load_faiss_db():
+    try:
+        # Load the highly optimized FAISS vector database
+        index = faiss.read_index("dataset/employee_index.faiss")
+        
+        # Load the metadata map (IDs and text_for_llm)
+        with open("dataset/employee_metadata.pkl", "rb") as f:
+            metadata = pickle.load(f)
+            
+        return index, metadata
+    except Exception as e:
+        st.error(f"Error loading database: Make sure 'employee_index.faiss' and 'employee_metadata.pkl' are in the 'dataset/' folder. ({e})")
+        st.stop()
 
-# Seed the Vector DB on startup (only if empty)
-if collection.count() == 0:
-    collection.add(
-        documents=[exp["profile"] for exp in db],
-        metadatas=[{"id": exp["id"], "name": exp["name"]} for exp in db],
-        ids=[exp["id"] for exp in db]
-    )
+index, metadata = load_faiss_db()
 
-# --- 3. LLM GENERATORS ---
+# --- 3. HELPER FUNCTIONS ---
+def get_query_embedding(text):
+    """
+    ⚠️ CRITICAL STEP ⚠️
+    This function converts the user's query into a math vector so FAISS can search it.
+    """
+    try:
+        # Switched to the universally supported embedding-001 model!
+        result = genai.embed_content(
+            model="models/embedding-001", 
+            content=text,
+            task_type="retrieval_query"
+        )
+        # FAISS strictly requires numpy arrays of type float32, shaped as (1, dimension)
+        return np.array([result['embedding']], dtype=np.float32)
+    except Exception as e:
+        st.error(f"Embedding failed: {e}")
+        st.stop()
+
 def generate_dossier(user_problem, skills_needed, matched_expert):
     prompt = f"""
     Act as a Cross-Industry Innovation Matchmaker.
     
     The user is trying to solve this problem: "{user_problem}"
-    The core skills/domain knowledge required are: "{skills_needed}"
+    The core skills required are: "{skills_needed}"
     
-    You matched them with {matched_expert['name']}. 
-    Here is their employee profile: "{matched_expert['profile']}"
+    You matched them with Employee {matched_expert['id']}. 
+    Here is their profile: "{matched_expert['text_for_llm']}"
     
     Write a short, professional 'Match Dossier' formatted in Markdown. Include:
-    1. Why they were Matched (1 sentence bridging the user's problem with the employee's background/certifications).
-    2. Profile Breakdown (Brief summary of their sector, experience level, and certifications based strictly on their profile).
-    3. Collaboration Pros (2 bullet points on how their specific background helps solve the bottleneck).
-    4. Potential Friction (1 bullet point on what cross-sector differences they might need to overcome).
+    1. Why they were Matched (1 sentence bridging the user's problem with their profile).
+    2. Profile Breakdown (Brief summary of their sector and certifications).
+    3. Collaboration Pros (2 bullet points on how their specific background helps).
+    4. Potential Friction (1 bullet point on cross-sector differences).
     """
     return model.generate_content(prompt).text
 
 def draft_intro_email(user_problem, matched_expert):
     prompt = f"""
-    Draft a professional, warm email introduction from the User to {matched_expert['name']}.
+    Draft a professional email introduction from the User to Employee {matched_expert['id']}.
     The User is facing this problem: "{user_problem}".
+    The User is reaching out because of the employee's background: "{matched_expert['text_for_llm']}".
     
-    The User is reaching out because of the employee's background: "{matched_expert['profile']}".
-    
-    Acknowledge their expertise, highlight why their specific background is exactly what is needed to solve the problem, and ask for a quick sync. Keep it under 150 words. Do not use placeholders like [Your Name].
+    Acknowledge their expertise, highlight why their background solves the problem, and ask for a quick sync. Keep it under 150 words. Do not use placeholders like [Your Name].
     """
     return model.generate_content(prompt).text
 
 # --- 4. STREAMLIT UI ---
 st.set_page_config(page_title="Nexus: AI Talent Matchmaker", layout="centered")
-st.title("🤝 Nexus: Cross-Discipline Matchmaker")
-st.markdown("Enter your specific technical bottleneck. We will abstract the core skills needed and match you with a vetted employee across the company who has the right expertise.")
+st.title("🤝 Nexus: FAISS Accelerated Matchmaker")
+st.markdown("Enter your specific technical bottleneck. We will abstract the core skills needed and instantly perform a vector search across **10,000 employees** to find the exact match.")
 
-user_input = st.text_area("What are you currently stuck on?", placeholder="e.g., I need to build a scalable, cloud-based financial forecasting model but I am struggling with the architecture...")
+user_input = st.text_area("What are you currently stuck on?", placeholder="e.g., I need to build a scalable, cloud-based financial forecasting model...")
 
 if st.button("Find My Match"):
     if user_input:
-        with st.spinner("Analyzing problem and searching the talent matrix..."):
-            # 1. Abstract the user's input into core skills
+        with st.spinner("Abstracting skills and performing millisecond FAISS search..."):
+            # 1. Abstract the user's input
             abstract_prompt = f"Summarize the core technical skills, sectors, and certifications required to solve this problem in one short sentence: {user_input}"
             skills_needed = model.generate_content(abstract_prompt).text.strip()
             
             st.info(f"**Core Expertise Required:** {skills_needed}")
             
-            # 2. Query Vector DB against the text_for_llm profiles
-            results = collection.query(
-                query_texts=[skills_needed],
-                n_results=1
-            )
+            # 2. Embed the abstracted skills into a math vector
+            query_vector = get_query_embedding(skills_needed)
             
-            if not results['ids'][0]:
+            # 3. Search the FAISS Index (k=1 means return the closest single match)
+            distances, indices = index.search(query_vector, k=1)
+            match_index = indices[0][0]
+            
+            if match_index == -1:
                 st.warning("Could not find a match in the database.")
                 st.stop()
                 
-            # 3. Process the Match
-            match_id = results['ids'][0][0]
-            matched_expert = next(exp for exp in db if exp['id'] == match_id)
+            # 4. Retrieve metadata from the .pkl file
+            matched_expert = metadata[match_index]
             
-            st.success(f"Match found: **{matched_expert['name']}**!")
+            st.success(f"Match found: **Employee {matched_expert['id']}**!")
             
-        with st.spinner(f"Analyzing synergy between your problem and {matched_expert['name']}'s profile..."):
-            # 4. Generate LLM Dossier
+        with st.spinner(f"Analyzing synergy between your problem and Employee {matched_expert['id']}..."):
+            # 5. Generate LLM Dossier
             dossier = generate_dossier(user_input, skills_needed, matched_expert)
             
-            # 5. Display Dossier
+            # 6. Display Dossier
             st.markdown("---")
             st.markdown(dossier)
             
             st.markdown("### Contact Details")
-            st.write(f"📧 **Email:** {matched_expert['contact']}")
+            st.write(f"📧 **Email:** emp_{matched_expert['id']}@synthetic-company.com")
             
-            # Save state for the email button
+            # Save state
             st.session_state['matched_expert'] = matched_expert
             st.session_state['user_input'] = user_input
             st.session_state['email_draft'] = None
 
-# If a match has been found, show the email drafting buttons
+# Show email buttons if state exists
 if 'matched_expert' in st.session_state:
     st.markdown("---")
     col1, col2 = st.columns(2)
@@ -158,7 +174,6 @@ if 'matched_expert' in st.session_state:
             st.session_state.clear()
             st.rerun()
 
-    # Display the drafted email if generated
     if st.session_state.get('email_draft'):
         st.markdown("### Suggested Introduction Email")
         st.text_area("Copy and send this to the expert:", value=st.session_state['email_draft'], height=200)
