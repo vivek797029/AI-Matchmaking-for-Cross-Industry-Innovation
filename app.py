@@ -4,9 +4,9 @@ import pickle
 import numpy as np
 import os
 from dotenv import load_dotenv
-import google.generativeai as genai
 
-# NEW IMPORT: Bring in Sentence Transformers for the 384-dimension embeddings
+# NEW IMPORTS: Modern Google SDK & Sentence Transformers
+from google import genai
 from sentence_transformers import SentenceTransformer
 
 # --- 1. SETUP & CONFIG ---
@@ -17,44 +17,16 @@ if not GEMINI_API_KEY:
     st.error("Missing API Key! Please add GEMINI_API_KEY to your .env file.")
     st.stop()
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-3.1-pro') 
-
-# Initialize the local embedding model (This perfectly matches your .faiss file!)
-@st.cache_resource
-def load_embedding_model():
-    return SentenceTransformer('all-MiniLM-L6-v2')
-
-embedding_model = load_embedding_model()
-
-# ... (Keep your load_faiss_db function the same) ...
-
-def get_query_embedding(text):
-    """
-    Converts the user's query into a 384-dimension math vector 
-    using the exact same model that built the FAISS index.
-    """
-    try:
-        # Encode the text locally using Sentence Transformers
-        embedding = embedding_model.encode(text)
-        
-        # FAISS strictly requires numpy arrays of type float32, shaped as (1, dimension)
-        return np.array([embedding], dtype=np.float32)
-    except Exception as e:
-        st.error(f"Embedding failed: {e}")
-        st.stop()
+# Initialize the NEW Google GenAI Client
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 # --- 2. LOAD FAISS DATABASE & METADATA ---
 @st.cache_resource
 def load_faiss_db():
     try:
-        # Load the highly optimized FAISS vector database
         index = faiss.read_index("dataset/employee_index.faiss")
-        
-        # Load the metadata map (IDs and text_for_llm)
         with open("dataset/employee_metadata.pkl", "rb") as f:
             metadata = pickle.load(f)
-            
         return index, metadata
     except Exception as e:
         st.error(f"Error loading database: Make sure 'employee_index.faiss' and 'employee_metadata.pkl' are in the 'dataset/' folder. ({e})")
@@ -63,20 +35,17 @@ def load_faiss_db():
 index, metadata = load_faiss_db()
 
 # --- 3. HELPER FUNCTIONS ---
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer('all-MiniLM-L6-v2')
+
+embedding_model = load_embedding_model()
+
 def get_query_embedding(text):
-    """
-    ⚠️ CRITICAL STEP ⚠️
-    This function converts the user's query into a math vector so FAISS can search it.
-    """
+    """Converts the user's query into a 384-dimension math vector."""
     try:
-        # Switched to the universally supported embedding-001 model!
-        result = genai.embed_content(
-            model="models/embedding-001", 
-            content=text,
-            task_type="retrieval_query"
-        )
-        # FAISS strictly requires numpy arrays of type float32, shaped as (1, dimension)
-        return np.array([result['embedding']], dtype=np.float32)
+        embedding = embedding_model.encode(text)
+        return np.array([embedding], dtype=np.float32)
     except Exception as e:
         st.error(f"Embedding failed: {e}")
         st.stop()
@@ -84,10 +53,8 @@ def get_query_embedding(text):
 def generate_dossier(user_problem, skills_needed, matched_expert):
     prompt = f"""
     Act as a Cross-Industry Innovation Matchmaker.
-    
     The user is trying to solve this problem: "{user_problem}"
     The core skills required are: "{skills_needed}"
-    
     You matched them with Employee {matched_expert['id']}. 
     Here is their profile: "{matched_expert['text_for_llm']}"
     
@@ -97,7 +64,9 @@ def generate_dossier(user_problem, skills_needed, matched_expert):
     3. Collaboration Pros (2 bullet points on how their specific background helps).
     4. Potential Friction (1 bullet point on cross-sector differences).
     """
-    return model.generate_content(prompt).text
+    # UPDATED SDK CALL
+    response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+    return response.text
 
 def draft_intro_email(user_problem, matched_expert):
     prompt = f"""
@@ -107,7 +76,9 @@ def draft_intro_email(user_problem, matched_expert):
     
     Acknowledge their expertise, highlight why their background solves the problem, and ask for a quick sync. Keep it under 150 words. Do not use placeholders like [Your Name].
     """
-    return model.generate_content(prompt).text
+    # UPDATED SDK CALL
+    response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+    return response.text
 
 # --- 4. STREAMLIT UI ---
 st.set_page_config(page_title="Nexus: AI Talent Matchmaker", layout="centered")
@@ -119,16 +90,16 @@ user_input = st.text_area("What are you currently stuck on?", placeholder="e.g.,
 if st.button("Find My Match"):
     if user_input:
         with st.spinner("Abstracting skills and performing millisecond FAISS search..."):
-            # 1. Abstract the user's input
+            
+            # UPDATED SDK CALL
             abstract_prompt = f"Summarize the core technical skills, sectors, and certifications required to solve this problem in one short sentence: {user_input}"
-            skills_needed = model.generate_content(abstract_prompt).text.strip()
+            skills_response = client.models.generate_content(model='gemini-2.5-flash', contents=abstract_prompt)
+            skills_needed = skills_response.text.strip()
             
             st.info(f"**Core Expertise Required:** {skills_needed}")
             
-            # 2. Embed the abstracted skills into a math vector
             query_vector = get_query_embedding(skills_needed)
             
-            # 3. Search the FAISS Index (k=1 means return the closest single match)
             distances, indices = index.search(query_vector, k=1)
             match_index = indices[0][0]
             
@@ -136,28 +107,23 @@ if st.button("Find My Match"):
                 st.warning("Could not find a match in the database.")
                 st.stop()
                 
-            # 4. Retrieve metadata from the .pkl file
             matched_expert = metadata[match_index]
             
             st.success(f"Match found: **Employee {matched_expert['id']}**!")
             
         with st.spinner(f"Analyzing synergy between your problem and Employee {matched_expert['id']}..."):
-            # 5. Generate LLM Dossier
             dossier = generate_dossier(user_input, skills_needed, matched_expert)
             
-            # 6. Display Dossier
             st.markdown("---")
             st.markdown(dossier)
             
             st.markdown("### Contact Details")
             st.write(f"📧 **Email:** emp_{matched_expert['id']}@synthetic-company.com")
             
-            # Save state
             st.session_state['matched_expert'] = matched_expert
             st.session_state['user_input'] = user_input
             st.session_state['email_draft'] = None
 
-# Show email buttons if state exists
 if 'matched_expert' in st.session_state:
     st.markdown("---")
     col1, col2 = st.columns(2)
