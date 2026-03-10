@@ -19,35 +19,30 @@ model = genai.GenerativeModel('gemini-3.1-pro')
 
 # Initialize ChromaDB (In-memory)
 chroma_client = chromadb.Client()
-collection = chroma_client.get_or_create_collection(name="unified_experts")
+collection = chroma_client.get_or_create_collection(name="employee_skills")
 
-# --- 2. LOAD UNIFIED DATABASE (Upgraded for Pandas/CSV) ---
-@st.cache_data
-# --- 2. LOAD UNIFIED DATABASE (Pointed to your dataset) ---
+# --- 2. LOAD YOUR SPECIFIC DATABASE ---
 @st.cache_data
 def load_database():
     try:
-        # Pointing exactly to your filepath
+        # Loading your specific dataset
         df = pd.read_csv('dataset/cleaned_employee_llm_data.csv')
         
+        # ⚠️ Hackathon Tip: Loading 10,000 rows into a vector DB takes time. 
+        # For a fast demo, we limit to 500. Change this number if you want more!
+        df_demo = df.head(10000) 
+        
         db_list = []
-        for index, row in df.iterrows():
-            # ⚠️ HACKATHON ALERT: Change the text inside the quotes below to match YOUR actual CSV column headers!
-            # For example, if your CSV uses 'EmployeeName' instead of 'name', change row.get('name') to row.get('EmployeeName')
+        for index, row in df_demo.iterrows():
+            emp_id = str(row['id'])
+            profile_text = str(row['text_for_llm'])
             
+            # Since the data is condensed, we map what we can and synthesize the rest
             db_list.append({
-                "id": str(row.get('id', f"exp_{index}")),
-                "name": str(row.get('name', 'Unknown')),
-                "industry": str(row.get('industry', 'Unknown Domain')), 
-                "contact": str(row.get('contact', 'No contact provided')),
-                "credentials": {
-                    "accolades": str(row.get('accolades', 'None')),
-                    "past_projects": str(row.get('past_projects', 'None')),
-                    "key_skills": [skill.strip() for skill in str(row.get('key_skills', '')).split(',')]
-                },
-                "jargon_problem": str(row.get('jargon_problem', '')), # The employee's current bottleneck
-                "abstract_problem": str(row.get('abstract_problem', '')), # THIS IS REQUIRED FOR CHROMADB
-                "glossary": str(row.get('glossary', 'No glossary provided'))
+                "id": emp_id,
+                "name": f"Employee {emp_id}",
+                "contact": f"emp_{emp_id}@synthetic-company.com",
+                "profile": profile_text
             })
         return db_list
         
@@ -63,33 +58,27 @@ db = load_database()
 # Seed the Vector DB on startup (only if empty)
 if collection.count() == 0:
     collection.add(
-        documents=[exp["abstract_problem"] for exp in db if exp["abstract_problem"]],
-        metadatas=[{"id": exp["id"], "name": exp["name"]} for exp in db if exp["abstract_problem"]],
-        ids=[exp["id"] for exp in db if exp["abstract_problem"]]
+        documents=[exp["profile"] for exp in db],
+        metadatas=[{"id": exp["id"], "name": exp["name"]} for exp in db],
+        ids=[exp["id"] for exp in db]
     )
 
 # --- 3. LLM GENERATORS ---
-def generate_dossier(user_problem, abstract_problem, matched_expert):
+def generate_dossier(user_problem, skills_needed, matched_expert):
     prompt = f"""
     Act as a Cross-Industry Innovation Matchmaker.
     
-    User's Original Problem: "{user_problem}"
-    Abstracted Core Problem: "{abstract_problem}"
+    The user is trying to solve this problem: "{user_problem}"
+    The core skills/domain knowledge required are: "{skills_needed}"
     
-    Matched Expert: {matched_expert['name']} ({matched_expert['industry']})
-    Expert's Jargon Problem: "{matched_expert['jargon_problem']}"
-    Expert's Glossary/Context: {matched_expert['glossary']}
-    
-    Credentials:
-    - Accolades: {matched_expert['credentials']['accolades']}
-    - Past Projects: {matched_expert['credentials']['past_projects']}
-    - Skills: {', '.join(matched_expert['credentials']['key_skills'])}
+    You matched them with {matched_expert['name']}. 
+    Here is their employee profile: "{matched_expert['profile']}"
     
     Write a short, professional 'Match Dossier' formatted in Markdown. Include:
-    1. Shared Abstract Concept (1 sentence on why their problems mathematically/structurally overlap).
-    2. Credential Analysis (Brief summary of why they are qualified to help).
-    3. Why this is a Match (Pros) (2 bullet points).
-    4. Potential Friction (Cons) (1 bullet point on what jargon they might misunderstand).
+    1. Why they were Matched (1 sentence bridging the user's problem with the employee's background/certifications).
+    2. Profile Breakdown (Brief summary of their sector, experience level, and certifications based strictly on their profile).
+    3. Collaboration Pros (2 bullet points on how their specific background helps solve the bottleneck).
+    4. Potential Friction (1 bullet point on what cross-sector differences they might need to overcome).
     """
     return model.generate_content(prompt).text
 
@@ -97,47 +86,48 @@ def draft_intro_email(user_problem, matched_expert):
     prompt = f"""
     Draft a professional, warm email introduction from the User to {matched_expert['name']}.
     The User is facing this problem: "{user_problem}".
-    The Expert is solving this problem: "{matched_expert['jargon_problem']}".
     
-    Acknowledge the difference in their industries ({matched_expert['industry']}), but highlight the shared abstract structural/mathematical challenge. Keep it under 150 words. Do not use placeholders like [Your Name].
+    The User is reaching out because of the employee's background: "{matched_expert['profile']}".
+    
+    Acknowledge their expertise, highlight why their specific background is exactly what is needed to solve the problem, and ask for a quick sync. Keep it under 150 words. Do not use placeholders like [Your Name].
     """
     return model.generate_content(prompt).text
 
 # --- 4. STREAMLIT UI ---
-st.set_page_config(page_title="Nexus: Cross-Industry Matcher", layout="centered")
-st.title("🤝 Nexus: Abstract Problem Matcher")
-st.markdown("Enter your specific technical bottleneck. We will abstract it and match you with a vetted expert from a completely different field solving the exact same core problem.")
+st.set_page_config(page_title="Nexus: AI Talent Matchmaker", layout="centered")
+st.title("🤝 Nexus: Cross-Discipline Matchmaker")
+st.markdown("Enter your specific technical bottleneck. We will abstract the core skills needed and match you with a vetted employee across the company who has the right expertise.")
 
-user_input = st.text_area("What are you currently stuck on?", placeholder="e.g., I need to fixate the distal femur without compromising the periosteal blood supply...")
+user_input = st.text_area("What are you currently stuck on?", placeholder="e.g., I need to build a scalable, cloud-based financial forecasting model but I am struggling with the architecture...")
 
 if st.button("Find My Match"):
     if user_input:
-        with st.spinner("Abstracting problem and searching vector space..."):
-            # 1. Abstract the user's input
-            abstract_prompt = f"Summarize the structural/mathematical core of this problem in one sentence, removing all industry jargon: {user_input}"
-            abstracted_problem = model.generate_content(abstract_prompt).text.strip()
+        with st.spinner("Analyzing problem and searching the talent matrix..."):
+            # 1. Abstract the user's input into core skills
+            abstract_prompt = f"Summarize the core technical skills, sectors, and certifications required to solve this problem in one short sentence: {user_input}"
+            skills_needed = model.generate_content(abstract_prompt).text.strip()
             
-            st.info(f"**Abstracted Problem:** {abstracted_problem}")
+            st.info(f"**Core Expertise Required:** {skills_needed}")
             
-            # 2. Query Vector DB
+            # 2. Query Vector DB against the text_for_llm profiles
             results = collection.query(
-                query_texts=[abstracted_problem],
+                query_texts=[skills_needed],
                 n_results=1
             )
             
             if not results['ids'][0]:
-                st.warning("Could not find a match in the database. Try adding more experts!")
+                st.warning("Could not find a match in the database.")
                 st.stop()
                 
             # 3. Process the Match
             match_id = results['ids'][0][0]
             matched_expert = next(exp for exp in db if exp['id'] == match_id)
             
-            st.success(f"Match found in **{matched_expert['industry']}**!")
+            st.success(f"Match found: **{matched_expert['name']}**!")
             
-        with st.spinner(f"Analyzing credentials and synergy for {matched_expert['name']}..."):
+        with st.spinner(f"Analyzing synergy between your problem and {matched_expert['name']}'s profile..."):
             # 4. Generate LLM Dossier
-            dossier = generate_dossier(user_input, abstracted_problem, matched_expert)
+            dossier = generate_dossier(user_input, skills_needed, matched_expert)
             
             # 5. Display Dossier
             st.markdown("---")
@@ -158,7 +148,7 @@ if 'matched_expert' in st.session_state:
     
     with col1:
         if st.button("✅ Approve & Draft Intro Message"):
-            with st.spinner("Drafting personalized email bridging your domains..."):
+            with st.spinner("Drafting personalized email..."):
                 st.session_state['email_draft'] = draft_intro_email(
                     st.session_state['user_input'], 
                     st.session_state['matched_expert']
